@@ -45,6 +45,8 @@ int main(int argc, char **argv) {
 
     char command_buffer[128]; // Los comandos tienen longitud máxima de 128 caracteres
 
+    int shutting_down = 0;
+
     while (1){
         // 3. Llamamos a poll con un timeout corto (500 ms). 
         // Esto evita que se bloquee el ciclo principal.
@@ -80,71 +82,219 @@ int main(int argc, char **argv) {
                     if (arg_count < 2) {
                         printf("Error: launch requiere al menos un ejecutable.\n");
                     } else {
-                        printf("Iniciando launch para el ejecutable: %s\n", args[1]);
-                        // Por hacer: Implementar la logica de fork y pipe para launch
+                        // 1. Buscar un slot disponible
+                        int slot = -1;
                         for (int i = 0; i < MAX_CAMERAS; i++) {
-                            if (cameras[i].state == EMPTY) {
-                                int pipefd[2];
-                                pipe(pipefd);
-                                pid_t pid = fork();
-                                if (pid == 0) {
-                                    dup2(pipefd[1], FAZWATCH_FD);
-                                    close(pipefd[0]);
-                                    for (int i = 0; i < MAX_CAMERAS; i++) {
-                                        if (cameras[i].state != EMPTY && cameras[i].fd != -1) {
-                                            close(cameras[i].fd);
-                                        }
-                                    }
-                                    execvp(args[1], &args[1]);
-                                    perror("Error en el execvp. \n");
+                            if (cameras[i].state == EMPTY || cameras[i].state == FINISHED) {
+                                slot = i;
+                                break;
+                            }
+                        }
+
+                        if (slot == -1) {
+                            printf("Error: Limite maximo de camaras (%d) alcanzado.\n", MAX_CAMERAS);
+                        } else {
+                            int pipefd[2];
+                            if (pipe(pipefd) == -1) {
+                                perror("Error en pipe");
+                                continue;
+                            }
+
+                            pid_t pid = fork();
+                            if (pid == -1) {
+                                perror("Error en fork");
+                                close(pipefd[0]);
+                                close(pipefd[1]);
+                            } else if (pid == 0) {
+                                // --- HIJO (CAMARA) ---
+                                close(pipefd[0]); // Cerrar lectura
+
+                                // Redirigir extremo de escritura al descriptor reservado (FD 3)
+                                if (dup2(pipefd[1], FAZWATCH_FD) == -1) {
+                                    perror("Error en dup2");
                                     exit(EXIT_FAILURE);
                                 }
-                                if (pid > 1) {
-                                    close(pipefd[1]);
-                                    printf("Camara iniciada con el PID: %d. \n", pid);
-                                    cameras[i].pid = pid;
-                                    cameras[i].fd = pipefd[0];
-                                    cameras[i].state = RUNNING;
-                                    cameras[i].last_heartbeat = time(NULL);
-                                    fds[i].fd = pipefd[0];
+                                close(pipefd[1]); // Cerrar copia original
+
+                                // Cerrar pipes heredados de otras camaras activas
+                                for (int j = 0; j < MAX_CAMERAS; j++) {
+                                    if (cameras[j].state != EMPTY && cameras[j].fd != -1) {
+                                        close(cameras[j].fd);
+                                    }
                                 }
-                            };
+
+                                execvp(args[1], &args[1]);
+                                perror("Error en execvp");
+                                exit(EXIT_FAILURE);
+                            } else {
+                                // --- PADRE (FAZWATCH) ---
+                                close(pipefd[1]);
+
+                                cameras[slot].pid = pid;
+                                cameras[slot].fd = pipefd[0];
+                                strncpy(cameras[slot].name, args[1], sizeof(cameras[slot].name) - 1);
+                                cameras[slot].state = RUNNING;
+                                cameras[slot].last_heartbeat = time(NULL);
+                                cameras[slot].exit_status = -1;
+
+                                // Mapear al arreglo de poll (indice slot + 1)
+                                fds[slot + 1].fd = pipefd[0];
+                                fds[slot + 1].events = POLLIN;
+
+                                printf("Camara iniciada con PID %d.\n", pid);
+                            }
                         }
                     }
-                } 
+                }
                 else if (strcmp(args[0], "status") == 0) {
                     printf("Ejecutando status...\n");
-                    // Por hacer: Mostrar el estado de todas las camaras
+                    printf("PID\t| Ejecutable\t| Estado\t| Ultimo HB (s)\t| Exit Code/Signal\n");
+    for (int i = 0; i < MAX_CAMERAS; i++) {
+        if (cameras[i].state != EMPTY) {
+            const char *state_str = "UNKNOWN";
+            if (cameras[i].state == RUNNING) state_str = "RUNNING";
+            else if (cameras[i].state == PAUSED) state_str = "PAUSED";
+            else if (cameras[i].state == TERMINATING) state_str = "TERMINATING";
+            else if (cameras[i].state == FINISHED) state_str = "FINISHED";
+
+            long diff = (cameras[i].state == RUNNING) ? (time(NULL) - cameras[i].last_heartbeat) : 0;
+            printf("%d\t| %s\t| %s\t| %ld\t\t| %d\n", 
+                   cameras[i].pid, cameras[i].name, state_str, diff, cameras[i].exit_status);
+        }
+    }
+}
                 } 
                 else if (strcmp(args[0], "pause") == 0) {
-                    if (arg_count < 2) printf("Error: pause requiere un PID.\n");
-                    else printf("Pausando PID: %s\n", args[1]);
-                    // Por hacer: Implementar envio de SIGSTOP
-                } 
+                    if (arg_count < 2) { 
+                        printf("Error: pause requiere un PID.\n");
+                    } else {
+                        pid_t target_pid = atoi(args[1]);
+                        for (int i = 0; i < MAX_CAMERAS; i++) {
+                            if (cameras[i].pid == target_pid && cameras[i].state == RUNNING) {
+                                kill(target_pid, SIGSTOP);
+                                cameras[i].state = PAUSED;
+                                printf("Camara %d pausada.\n", target_pid);
+                                break;
+                            }
+                        }
+                    }
+                }
                 else if (strcmp(args[0], "resume") == 0) {
-                    if (arg_count < 2) printf("Error: resume requiere un PID.\n");
-                    else printf("Reanudando PID: %s\n", args[1]);
-                    // Por hacer: Implementar envio de SIGCONT
-                } 
+                    if (arg_count < 2) {
+                        printf("Error: resume requiere un PID.\n");
+                    } else {
+                        pid_t target_pid = atoi(args[1]);
+                        for (int i = 0; i < MAX_CAMERAS; i++) {
+                            if (cameras[i].pid == target_pid && cameras[i].state == PAUSED) {
+                                kill(target_pid, SIGCONT);
+                                cameras[i].state = RUNNING;
+                                cameras[i].last_heartbeat = time(NULL); // Reiniciar timeout
+                                printf("Camara %d reanudada.\n", target_pid);
+                                break;
+                            }
+                        }
+                    }
+                }
                 else if (strcmp(args[0], "terminate") == 0) {
-                    if (arg_count < 2) printf("Error: terminate requiere un PID.\n");
-                    else printf("Terminando PID: %s\n", args[1]);
-                    // Por hacer: Implementar envio de SIGTERM
-                } 
+                    if (arg_count < 2) {
+                        printf("Error: terminate requiere un PID.\n");
+                    } else {
+                        pid_t target_pid = atoi(args[1]);
+                        for (int i = 0; i < MAX_CAMERAS; i++) {
+                            if (cameras[i].pid == target_pid && cameras[i].state == RUNNING) {
+                                kill(target_pid, SIGTERM);
+                                cameras[i].state = TERMINATING;
+                                cameras[i].terminate_time = time(NULL);
+                                printf("Terminando camara %d...\n", target_pid);
+                                break;
+                            }
+                        }
+                    }
+                }
                 else if (strcmp(args[0], "shutdown") == 0) {
                     printf("Iniciando apagado del sistema...\n");
-                    // Por hacer: Implementar logica de shutdown
+                    shutting_down = 1;
+                    for (int i = 0; i < MAX_CAMERAS; i++) {
+                        if (cameras[i].state == RUNNING || cameras[i].state == PAUSED) {
+                            kill(cameras[i].pid, SIGTERM);
+                            cameras[i].state = TERMINATING;
+                            cameras[i].terminate_time = time(NULL);
+                        }
+                    }
                 } 
                 else {
                     printf("Comando desconocido: %s\n", args[0]);
                 }
             }
-        }
+        } // Fin de if (fds[0].revents & POLLIN)
+
+        // --- 1. LECTURA DE HEARTBEATS ---
+        for (int i = 0; i < MAX_CAMERAS; i++) {
+            if (cameras[i].state == RUNNING && (fds[i + 1].revents & POLLIN)) {
+                char buffer[16];
+                ssize_t bytes = read(cameras[i].fd, buffer, sizeof(buffer));
+                if (bytes > 0) {
+                    for (ssize_t b = 0; b < bytes; b++) {
+                        if (buffer[b] == HEARTBEAT_BYTE) {
+                            cameras[i].last_heartbeat = time(NULL);
+                        }
+                    }
+                }
             }
-        return EXIT_SUCCESS;
+        }
+        
+        // --- 2. TIMEOUTS Y PERIODO DE GRACIA ---
+        time_t now = time(NULL);
+        int all_finished = 1; 
+
+        for (int i = 0; i < MAX_CAMERAS; i++) {
+            if (cameras[i].state != EMPTY && cameras[i].state != FINISHED) {
+                all_finished = 0; // Aún hay procesos vivos
+            }
+
+            // Detectar timeout en cámaras corriendo
+            if (cameras[i].state == RUNNING && (now - cameras[i].last_heartbeat >= heartbeat_timeout)) {
+                printf("Camara %d supero el timeout. Terminando...\n", cameras[i].pid);
+                kill(cameras[i].pid, SIGTERM);
+                cameras[i].state = TERMINATING;
+                cameras[i].terminate_time = now;
+            }
+            
+            // Aplicar SIGKILL tras 2 segundos de gracia
+            if (cameras[i].state == TERMINATING && (now - cameras[i].terminate_time >= 2)) {
+                kill(cameras[i].pid, SIGKILL);
+            }
         }
 
-        // Por hacer: Revisar los heartbeats de los hijos
-        // Por hacer: Limpiar procesos zombies con waitpid
+        // --- 3. RECOLECCIÓN DE ZOMBIES Y DESCRIPTORES ---
+        int status;
+        pid_t dead_pid;
+        while ((dead_pid = waitpid(-1, &status, WNOHANG)) > 0) {
+            for (int i = 0; i < MAX_CAMERAS; i++) {
+                if (cameras[i].pid == dead_pid && cameras[i].state != FINISHED) {
+                    cameras[i].state = FINISHED;
+                    
+                    if (cameras[i].fd != -1) {
+                        close(cameras[i].fd);
+                        cameras[i].fd = -1;
+                        fds[i + 1].fd = -1; // Desconectar de poll
+                    }
 
+                    if (WIFEXITED(status)) cameras[i].exit_status = WEXITSTATUS(status);
+                    else if (WIFSIGNALED(status)) cameras[i].exit_status = WTERMSIG(status);
+                    
+                    printf("Camara %d recolectada.\n", dead_pid);
+                    break;
+                }
+            }
+        }
+
+        // --- 4. APAGADO DEFINITIVO ---
+        if (shutting_down && all_finished) {
+            printf("Todas las camaras finalizadas. Cerrando fazwatch.\n");
+            break; 
+        }
+    } // Fin del while(1)
     
+    return EXIT_SUCCESS;
+} // Fin del main
